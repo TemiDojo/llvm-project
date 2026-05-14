@@ -859,6 +859,7 @@ void CodeGenPassBuilder<Derived, TargetMachineT>::addISelPrepare(
   // only protect functions that have corresponding attributes.
   addFunctionPass(SafeStackPass(TM), PMW);
   addFunctionPass(StackProtectorPass(TM), PMW);
+  addFunctionPass(VarGuardPass(TM), PMW);
 
   if (Opt.PrintISelInput)
     addFunctionPass(PrintFunctionPass(

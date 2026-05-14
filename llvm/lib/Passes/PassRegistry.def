@@ -387,6 +387,7 @@ FUNCTION_ANALYSIS("should-not-run-function-passes",
 FUNCTION_ANALYSIS("should-run-extra-vector-passes",
                   ShouldRunExtraVectorPasses())
 FUNCTION_ANALYSIS("ssp-layout", SSPLayoutAnalysis())
+FUNCTION_ANALYSIS("varguard-layout", VarGuardLayoutAnalysis())
 FUNCTION_ANALYSIS("stack-safety-local", StackSafetyAnalysis())
 FUNCTION_ANALYSIS("target-ir",
                   TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis())
@@ -577,6 +578,8 @@ FUNCTION_PASS("view-dom-only", DomOnlyViewer())
 FUNCTION_PASS("view-post-dom", PostDomViewer())
 FUNCTION_PASS("view-post-dom-only", PostDomOnlyViewer())
 FUNCTION_PASS("wasm-eh-prepare", WasmEHPreparePass())
+FUNCTION_PASS("varguard-hello", VarGuardHelloPass())
+FUNCTION_PASS("var-guard", VarGuardPass(*TM))
 #undef FUNCTION_PASS
 
 #ifndef FUNCTION_PASS_WITH_PARAMS

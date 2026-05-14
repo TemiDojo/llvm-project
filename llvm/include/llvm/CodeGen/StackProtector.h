@@ -65,6 +65,66 @@ public:
   void copyToMachineFrameInfo(MachineFrameInfo &MFI) const;
 };
 
+
+class VarGuardLayoutInfo {
+  friend class VarGuardPass;
+  friend class VarGuardLayoutAnalysis;
+  friend class VarGuard;
+  static constexpr unsigned DefaultVGBufferSize = 8;
+
+  /// A mapping of AllocaInsts to their required SSP layout.
+  using VarGuardLayoutMap =
+      DenseMap<const AllocaInst *, MachineFrameInfo::SSPLayoutKind>;
+
+  /// Layout - Mapping of allocations to the required SSPLayoutKind.
+  /// StackProtector analysis will update this map when determining if an
+  /// AllocaInst triggers a stack protector.
+  VarGuardLayoutMap Layout;
+
+  /// The minimum size of buffers that will receive stack smashing
+  /// protection when -fstack-protection is used.
+  unsigned VarGuardBufferSize = DefaultVGBufferSize;
+
+  bool RequireVarGuard = false;
+
+  // A prologue is generated.
+  bool HasPrologue = false;
+
+  // IR checking code is generated.
+  bool HasIRCheck = false;
+
+public:
+  // Return true if StackProtector is supposed to be handled by SelectionDAG.
+  bool shouldEmitVGCheck(const BasicBlock &BB) const;
+
+  void copyToVGMachineFrameInfo(MachineFrameInfo &MFI) const;
+
+  struct VarGuardObjectInfo {
+	  //Value *StructPtr;
+	  Value *BufPtr;
+	  Value *CanaryPtr;
+  };
+  DenseMap<const Value *, VarGuardObjectInfo> ProtectedObject;
+};
+
+class VarGuardLayoutAnalysis : public AnalysisInfoMixin<VarGuardLayoutAnalysis> {
+  friend AnalysisInfoMixin<VarGuardLayoutAnalysis>;
+  using VarGuardLayoutMap = VarGuardLayoutInfo::VarGuardLayoutMap;
+
+  static AnalysisKey Key;
+
+public:
+  using Result = VarGuardLayoutInfo;
+
+  Result run(Function &F, FunctionAnalysisManager &FAM);
+
+  /// Check whether or not \p F needs a stack protector based upon the stack
+  /// protector level.
+  static bool requiresVarGuard(Function *F,
+                                     VarGuardLayoutMap *Layout = nullptr);
+};
+
+
 class SSPLayoutAnalysis : public AnalysisInfoMixin<SSPLayoutAnalysis> {
   friend AnalysisInfoMixin<SSPLayoutAnalysis>;
   using SSPLayoutMap = SSPLayoutInfo::SSPLayoutMap;
@@ -89,6 +149,15 @@ public:
   explicit StackProtectorPass(const TargetMachine &TM) : TM(&TM) {}
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 };
+
+class VarGuardPass : public PassInfoMixin<VarGuardPass> {
+	const TargetMachine *TM;
+
+public:
+  explicit VarGuardPass(const TargetMachine &TM) : TM(&TM) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+};
+	
 
 class StackProtector : public FunctionPass {
 private:
@@ -129,6 +198,50 @@ public:
   static bool requiresStackProtector(Function *F,
                                      SSPLayoutMap *Layout = nullptr) {
     return SSPLayoutAnalysis::requiresStackProtector(F, Layout);
+  }
+};
+
+
+
+class VarGuard : public FunctionPass {
+private:
+  /// A mapping of AllocaInsts to their required SSP layout.
+  using VarGuardLayoutMap = VarGuardLayoutInfo::VarGuardLayoutMap;
+
+  const TargetMachine *TM = nullptr;
+
+  Function *F = nullptr;
+  Module *M = nullptr;
+
+  std::optional<DomTreeUpdater> DTU;
+
+  VarGuardLayoutInfo LayoutInfo;
+
+public:
+  static char ID; // Pass identification, replacement for typeid.
+
+  VarGuard();
+
+  VarGuardLayoutInfo &getLayoutInfo() { return LayoutInfo; }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override;
+
+  // Return true if StackProtector is supposed to be handled by SelectionDAG.
+  bool shouldEmitVGCheck(const BasicBlock &BB) const {
+    return LayoutInfo.shouldEmitVGCheck(BB);
+  }
+
+  bool runOnFunction(Function &Fn) override;
+
+  void copyToVGMachineFrameInfo(MachineFrameInfo &MFI) const {
+    LayoutInfo.copyToVGMachineFrameInfo(MFI);
+  }
+
+  /// Check whether or not \p F needs a stack protector based upon the stack
+  /// protector level.
+  static bool requiresVarGuard(Function *F,
+                                     VarGuardLayoutMap *Layout = nullptr) {
+    return VarGuardLayoutAnalysis::requiresVarGuard(F, Layout);
   }
 };
 

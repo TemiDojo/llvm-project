@@ -258,6 +258,7 @@ add_llvm_component_library(LLVMCodeGen
   WindowsSecureHotPatching.cpp
   WinEHPrepare.cpp
   XRayInstrumentation.cpp
+  VarGuard.cpp
   ${GeneratedMLSources}
 
   LiveDebugValues/LiveDebugValues.cpp

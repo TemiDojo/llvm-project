@@ -421,6 +421,11 @@ LLVM_ABI extern char &PatchableFunctionID;
 ///
 LLVM_ABI FunctionPass *createStackProtectorPass();
 
+/// *added
+/// createVarGuardPass - This pass adds var protectors to variables.
+///
+LLVM_ABI FunctionPass *createVarGuardPass();
+
 /// createMachineVerifierPass - This pass verifies cenerated machine code
 /// instructions for correctness.
 ///

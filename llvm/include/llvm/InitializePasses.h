@@ -317,6 +317,8 @@ LLVM_ABI void initializeStackFrameLayoutAnalysisLegacyPass(PassRegistry &);
 LLVM_ABI void initializeStaticDataSplitterPass(PassRegistry &);
 LLVM_ABI void initializeStackMapLivenessPass(PassRegistry &);
 LLVM_ABI void initializeStackProtectorPass(PassRegistry &);
+// *added
+LLVM_ABI void initializeVarGuardPass(PassRegistry &);
 LLVM_ABI void initializeStackSafetyGlobalInfoWrapperPassPass(PassRegistry &);
 LLVM_ABI void initializeStackSafetyInfoWrapperPassPass(PassRegistry &);
 LLVM_ABI void initializeStackSlotColoringLegacyPass(PassRegistry &);
