@@ -65,6 +65,60 @@ public:
   LLVM_ABI void copyToMachineFrameInfo(MachineFrameInfo &MFI) const;
 };
 
+
+class VarGuardLayoutInfo {
+  friend class VarGuardPass;
+  friend class VarGuardLayoutAnalysis;
+  friend class VarGuard;
+  static constexpr unsigned DefaultVGBufferSize = 8;
+
+  /// A mapping of AllocaInsts to their required SSP layout.
+  using VarGuardLayoutMap =
+      DenseMap<const AllocaInst *, MachineFrameInfo::SSPLayoutKind>;
+
+  /// Layout - Mapping of allocations to the required SSPLayoutKind.
+  /// StackProtector analysis will update this map when determining if an
+  /// AllocaInst triggers a stack protector.
+  VarGuardLayoutMap Layout;
+
+  /// The minimum size of buffers that will receive stack smashing
+  /// protection when -fstack-protection is used.
+  unsigned VarGuardBufferSize = DefaultVGBufferSize;
+
+  bool RequireVarGuard = false;
+
+  // A prologue is generated.
+  bool HasPrologue = false;
+
+  // IR checking code is generated.
+  bool HasIRCheck = false;
+
+public:
+  // Return true if StackProtector is supposed to be handled by SelectionDAG.
+  bool shouldEmitVGCheck(const BasicBlock &BB) const;
+
+  void copyToVGMachineFrameInfo(MachineFrameInfo &MFI) const;
+
+};
+
+class VarGuardLayoutAnalysis : public AnalysisInfoMixin<VarGuardLayoutAnalysis> {
+  friend AnalysisInfoMixin<VarGuardLayoutAnalysis>;
+  using VarGuardLayoutMap = VarGuardLayoutInfo::VarGuardLayoutMap;
+
+  static AnalysisKey Key;
+
+public:
+  using Result = VarGuardLayoutInfo;
+
+  Result run(Function &F, FunctionAnalysisManager &FAM);
+
+  /// Check whether or not \p F needs a stack protector based upon the stack
+  /// protector level.
+  static bool requiresVarGuard(Function *F,
+                                     VarGuardLayoutMap *Layout = nullptr);
+};
+
+
 class SSPLayoutAnalysis : public AnalysisInfoMixin<SSPLayoutAnalysis> {
   friend AnalysisInfoMixin<SSPLayoutAnalysis>;
   using SSPLayoutMap = SSPLayoutInfo::SSPLayoutMap;
@@ -82,7 +136,7 @@ public:
                                               SSPLayoutMap *Layout = nullptr);
 };
 
-class StackProtectorPass : public RequiredPassInfoMixin<StackProtectorPass> {
+class StackProtectorPass : public PassInfoMixin<StackProtectorPass> {
   const TargetMachine *TM;
 
 public:
