@@ -50,8 +50,14 @@ STATISTIC(NumFunProtected, "Number of functions protected");
 STATISTIC(NumAddrTaken, "Number of local variables that ahve their address taken");
 STATISTIC(NumVarProtected, "Number of variables protected");
 
-using VarGuardSlotMap =
-    DenseMap<Instruction *, AllocaInst *>;
+
+struct VarGuardObjectInfo {
+  //Value *StructPtr;
+  Value *BufPtr;
+  Value *CanaryPtr;
+};
+using VarGuardSlotMap = DenseMap<Value *, Value *>;
+
 
 // static: visible only in this .cpp file
 // cl::opt<boo> llvm command-line option of type bool
@@ -71,16 +77,23 @@ static cl::opt<bool> DisableVarGuardCheckNoReturn("disable-varguard-check-noretu
 // static here means: This helper is local to this .cpp file.
 // Other files cannot call it directly.
 static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
-									const LibcallLoweringInfo &Libcalls,
-									Function *F, DomTreeUpdater *DTU,
-									bool &HasPrologue, bool &HasIRCheck);
+                           const LibcallLoweringInfo &Libcalls, Function *F,
+                           DomTreeUpdater *DTU, bool &HasPrologue,
+                           bool &HasIRCheck);
+// static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
+// 									const LibcallLoweringInfo &Libcalls,
+// 									Function *F, DomTreeUpdater *DTU,
+// 									bool &HasPrologue, bool &HasIRCheck, VarGuardLayoutInfo::ProtectedObject);
 static BasicBlock *CreateVarGuardFailBB(Function *F, const LibcallLoweringInfo &Libcalls);
 static bool InsertChecks(const TargetLowering &TLI, 
 		const LibcallLoweringInfo &Libcalls, Function *F,
 		DomTreeUpdater *DTU, VarGuardSlotMap slotMap);
 static bool VisitUsesAndInsertChecks(const TargetLowering &TLI,
 		const LibcallLoweringInfo &Libcalls, Function *F,
-		DomTreeUpdater *DTU, Instruction *Ins, AllocaInst *VGslot, BasicBlock *&fb);
+		DomTreeUpdater *DTU, Instruction *Ins, Value *VGslot, BasicBlock *&fb);
+static bool WrapAllocaWithVarGuardStruct(const TargetLowering &TLI, 
+							const LibcallLoweringInfo &Libcalls, Function *F,
+							AllocaInst *OldAI, Value *&BufPtr, Value *&CanaryPtr);
 
 // should the backend / selectionDag emit a stack protector check for this block?
 // it returns true only if all thre conditions are true
@@ -209,6 +222,7 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
 
 	//bool changed = InsertVarGuards(*TLI, Libcalls, &F, DT ? &DTU : nullptr, Info.HasPrologue, Info.HasIRCheck);
 	errs() << "calling insert varguards\n";
+	//Info.ProtectedObject;
 	VarGuardSlotMap slotMap = InsertVarGuards(*TLI, Libcalls, &F, DT ? &DTU : nullptr, Info.HasPrologue, Info.HasIRCheck);
 
 	// write check 
@@ -844,6 +858,36 @@ static bool CreateVarGuardPrologue(Function *F, Module *M, AllocaInst *guardA,
 	return true;
 }
 
+static bool WrapAllocaWithVarGuardStruct(const TargetLowering &TLI, 
+							const LibcallLoweringInfo &Libcalls, Function *F,
+							AllocaInst *OldAI, Value *&BufPtr, Value *&CanaryPtr) {
+	LLVMContext &Ctx = F->getContext();
+	IRBuilder<> B(OldAI);
+
+	Type *BufTy = OldAI->getAllocatedType();
+
+	PointerType *CanaryTy = PointerType::getUnqual(Ctx);
+
+	Value *GuardPtr = TLI.getIRStackGuard(B, Libcalls);
+	if (!GuardPtr)
+		return false;
+	StructType *VGStructTy = StructType::create(Ctx, {BufTy, CanaryTy}, "varguard.struct");
+
+	AllocaInst *StructAI = B.CreateAlloca(VGStructTy, nullptr, "varguard.obj");
+	
+	CanaryPtr = B.CreateStructGEP(VGStructTy, StructAI, 1, "vg.canary.ptr");
+	BufPtr = B.CreateStructGEP(VGStructTy, StructAI, 0, "vg.buf.ptr");
+	
+	Value *Guardslot = B.CreateLoad(B.getPtrTy(), GuardPtr, true, "VarGuard");
+	Value *GuardValue = B.CreateStore(Guardslot, CanaryPtr, true);
+	
+	OldAI->replaceAllUsesWith(BufPtr);
+
+	return true;
+
+
+}
+
 /*
  * Find places where the function can exit.
  * Create the stack guard prologue if needed.
@@ -860,68 +904,48 @@ static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
   	auto *M = F->getParent(); // get the module containing the function
 
 	VarGuardSlotMap SlotMap;
+	//VarGuardLayoutInfo::VarGuardObjectInfo STInfo;
+	// VarGuardLayoutInfo::ProtectedObject Pvg;
   	AllocaInst *pAI = nullptr; // Place on stack that stores the stack guard.
+	std::vector<AllocaInst*> toRemove;
 
 	// it walks through every basic block in the function
 	// make_early_inc_range is important because this pass may modify the function while looping
 	// safely iterate evn if blocks are/inserted during the loop
-	 	for (BasicBlock &BB : llvm::make_early_inc_range(*F)) {
-	//
-	// 	// errs() << "in the basic loop\n";
-		// loop over instructions
+	for (BasicBlock &BB : llvm::make_early_inc_range(*F)) {
+
+ 	// errs() << "in the basic loop\n";
+	// loop over instructions
 		for (auto &Inst : BB) {
 			// errs() << "in the inst loop\n";
 			if (auto *AllocaI = dyn_cast<AllocaInst>(&Inst)) {
+			// auto *AllocaI = cast<AllocaInst>(&Inst);
 				if (AllocaI->getMetadata("varguard.protect")) {
 					// errs() << "alloca varguard proted\n";
 					AllocaInst *AI = nullptr;
-					if (CreateVarGuardPrologue(F, M, AllocaI, &TLI, Libcalls, AI)) {
-						auto *I = cast<Instruction>(AllocaI);
-					 	SlotMap[I] = AI;
-						// errs() << "Protected alloca: " << *AllocaI << "\n";
-						// errs() << "Guard slot: " << *AI << "\n";
-					}
+					Value *BufPtr = nullptr;
+					Value *CanaryPtr = nullptr;
+					if (!WrapAllocaWithVarGuardStruct(TLI, Libcalls, F, AllocaI, BufPtr, CanaryPtr))
+						continue;
+					toRemove.push_back(AllocaI);
+					SlotMap[BufPtr] = CanaryPtr;
 				}
 			}
 		}
 	}
 
-	// SmallVector<AllocaInst *, 8> ProtectedAllocas;
-	//
-	// for (BasicBlock &BB : *F) {
-	// 	for (Instruction &Inst : BB) {
-	// 		if (auto *AI = dyn_cast<AllocaInst>(&Inst)) {
-	// 			if (AI->getMetadata("varguard.protect"))
-	// 				ProtectedAllocas.push_back(AI);
-	// 			}
-	// 	  	}
-	// 	}
-	//
-	// 	for (size_t Idx = 0; Idx < ProtectedAllocas.size(); ++Idx) {
-	// 	  	// if (Idx == 0 || Idx + 1 == ProtectedAllocas.size())
-	// 		// if (Idx == 0)
-	// 		// 	continue;
-	//
-	// 	  	AllocaInst *AllocaI = ProtectedAllocas[Idx];
-	// 		// if (Idx + 1 == ProtectedAllocas.size()) {
-	// 		// 	SlotMap[AllocaI] = pAI;
-	// 		// }
-	// 		else if (CreateVarGuardPrologue(F, M, AllocaI, &TLI, Libcalls, AI)) {
-	// 			if (Idx == 0) {
-	// 				pAI = AI;
-	// 				continue;
-	// 			}
-	// 			SlotMap[AllocaI] = pAI;
-	// 			pAI = AI;
-	// 	  	}
-	// 	}
+	for (auto *AllocaI : toRemove) {
+		AllocaI->eraseFromParent();
+	}
+
+	
 
   	return SlotMap;
 }
 
 static bool VisitUsesAndInsertChecks(const TargetLowering &TLI,
 		const LibcallLoweringInfo &Libcalls, Function *F,
-		DomTreeUpdater *DTU, Instruction *Ins, AllocaInst *VGslot, BasicBlock *&fb) {
+		DomTreeUpdater *DTU, Instruction *Ins, Value *VGslot, BasicBlock *&fb) {
 
 	auto *M = F->getParent();
 		
@@ -1004,10 +1028,12 @@ static bool InsertChecks(const TargetLowering &TLI,
 
 	errs() << "looping through slotMap\n";	
 	for (auto &Entry : slotMap) {
-		Instruction *I = Entry.first;
-		AllocaInst *VGslot = Entry.second;
 
-		changed = VisitUsesAndInsertChecks(TLI, Libcalls, F, DTU, I, VGslot, FailBB);
+		auto *I = dyn_cast<Instruction>(Entry.first);
+		if (!I) continue;
+
+		Value *guardStore = Entry.second;
+		changed = VisitUsesAndInsertChecks(TLI, Libcalls, F, DTU, I, guardStore, FailBB);
 		
 	}
 

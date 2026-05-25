@@ -99,12 +99,6 @@ public:
 
   void copyToVGMachineFrameInfo(MachineFrameInfo &MFI) const;
 
-  struct VarGuardObjectInfo {
-	  //Value *StructPtr;
-	  Value *BufPtr;
-	  Value *CanaryPtr;
-  };
-  DenseMap<const Value *, VarGuardObjectInfo> ProtectedObject;
 };
 
 class VarGuardLayoutAnalysis : public AnalysisInfoMixin<VarGuardLayoutAnalysis> {
@@ -142,7 +136,7 @@ public:
                                      SSPLayoutMap *Layout = nullptr);
 };
 
-class StackProtectorPass : public RequiredPassInfoMixin<StackProtectorPass> {
+class StackProtectorPass : public PassInfoMixin<StackProtectorPass> {
   const TargetMachine *TM;
 
 public:
