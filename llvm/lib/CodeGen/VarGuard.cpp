@@ -232,7 +232,7 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
 	// read check
 	//InsertChecks(slotMap);
 	errs() << "calling insert checks\n";
-	bool changed = InsertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, slotMap);
+	InsertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, slotMap);
 
 	
 	
@@ -547,34 +547,6 @@ static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
 }
 
 
-/// Search for the first call to the llvm.stackprotector intrinsic and return it
-/// if present.
-// It searched a function for this intrinsic: llvm.stackprotector
-// that intrinsici represents LLVM stack protector prologue marker/checker setup
-// if it finds one, it returns the call instruction
-/*
- * This exists because InsertVarGuards may need to recover the stack guard slot that was created 
- * earlier. So it searches for the existing llvm.stackprotector call and extracts its argument.
- * This basically answers- has this function already been given a stack protection intrinsic
- * what is an intrinsic?
- */
-static const CallInst *findVarGuardIntrinsic(Function &F) {
-	// loop over basic block in the function.
-  	for (const BasicBlock &BB : F)
-		// loop over every instruction in that basic block
-    	for (const Instruction &I : BB)
-			// try to cast the instruction to an IntrinsicInst.
-			// An intrinsic is a special LLVM built-in function-like operation
-      		if (const auto *II = dyn_cast<IntrinsicInst>(&I))
-				// Check whether this intrinsic is specifically the stack protector intrinsic.
-        		if (II->getIntrinsicID() == Intrinsic::stackprotector)
-					// return it immediately
-          			return II;
-	// if nothing matched, return null
-	return nullptr;
-}
-
-
 /// Check whether or not this function needs a stack protector based
 /// upon the stack protector level.
 ///
@@ -663,14 +635,14 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
 					// [7] means capture surrounding variables by reference.
 					// It oes not emit immediately. It prepares a message taht can beemitted later with
 					// ORE.emit...
-          			auto RemarkBuilder = [&]() {
-            			return OptimizationRemark(DEBUG_TYPE, "VarGuardAllocaOrArray",
-                                      &I)
-                   			<< "Var Guard applied to variable "
-                   			<< ore::NV("Function", F)
-                   			<< " due to a call to alloca or use of a variable length "
-                      			"array";
-          			};
+          			// auto RemarkBuilder = [&]() {
+          			// 		return OptimizationRemark(DEBUG_TYPE, "VarGuardAllocaOrArray",
+          			//                          &I)
+          			//       			<< "Var Guard applied to variable "
+          			//       			<< ore::NV("Function", F)
+          			//       			<< " due to a call to alloca or use of a variable length "
+          			//          			"array";
+          			// };
 					// is the array size known at compile time?, if yes, CI is the constant integer.
           			if (auto *CI = dyn_cast<ConstantInt>(AI->getArraySize())) {
 						// if allocation count is at least the threshold, protect it.
@@ -820,44 +792,6 @@ static Value *getVarGuardValue(const TargetLoweringBase &TLI,
 	return nullptr;
 }
 
-/// Insert code into the entry block that stores the stack guard
-/// variable onto the stack:
-///
-///   entry:
-///     StackGuardSlot = alloca i8*
-///     StackGuard = <stack guard>
-///     call void @llvm.stackprotector(StackGuard, StackGuardSlot)
-///
-/// Returns true if the platform/triple supports the stackprotectorcreate pseudo
-/// node.
-static bool CreateVarGuardPrologue(Function *F, Module *M, AllocaInst *guardA,
-                           const TargetLoweringBase *TLI,
-                           const LibcallLoweringInfo &Libcalls,
-                           AllocaInst *&AI) {
-	// start by assuming selectionDag stack protector support is not needed -> what is selectionDag?
-  	bool SupportsSelectionDAGSP = false;
-	// create an IRBuilder positioned at the first instruction in the entry block.
-	// So new instuctions are inserted at the beginning of the function
-	IRBuilder<> B(guardA);
-	B.SetInsertPoint(B.GetInsertPoint());
-
-	Value *Guard = TLI->getIRStackGuard(B, Libcalls);
-	StringRef GuardMode = M->getStackProtectorGuard();
-	if ((GuardMode == "tls" || GuardMode.empty()) && Guard) {
-		// Get generic pointer type
-		PointerType *PtrTy = PointerType::getUnqual(guardA->getContext());
-		AI = B.CreateAlloca(PtrTy, nullptr, "VarGuardSlot");
-		Value *GuardSlot = B.CreateLoad(B.getPtrTy(), Guard, true, "VarGuard");
-		//B.CreateIntrinsic(Intrinsic::stackprotector, {GuardSlot, AI});
-		B.CreateStore(GuardSlot, AI, true);
-	}
-
-	if (SupportsSelectionDAGSP) 
-		return false;
-
-	return true;
-}
-
 static bool WrapAllocaWithVarGuardStruct(const TargetLowering &TLI, 
 							const LibcallLoweringInfo &Libcalls, Function *F,
 							AllocaInst *OldAI, Value *&BufPtr, Value *&CanaryPtr) {
@@ -879,9 +813,16 @@ static bool WrapAllocaWithVarGuardStruct(const TargetLowering &TLI,
 	BufPtr = B.CreateStructGEP(VGStructTy, StructAI, 0, "vg.buf.ptr");
 	
 	Value *Guardslot = B.CreateLoad(B.getPtrTy(), GuardPtr, true, "VarGuard");
-	Value *GuardValue = B.CreateStore(Guardslot, CanaryPtr, true);
+	B.CreateStore(Guardslot, CanaryPtr, true);
 	
-	OldAI->replaceAllUsesWith(BufPtr);
+	OldAI->replaceUsesWithIf(BufPtr, [](Use &U) -> bool {
+        auto const *const user = U.getUser();
+        if (auto const *const CI = dyn_cast<CallInst>(user)) {
+            return !CI->isLifetimeStartOrEnd();
+        }
+        return true;
+    });
+	OldAI->replaceAllUsesWith(StructAI);
 
 	return true;
 
@@ -901,12 +842,9 @@ static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
                            const LibcallLoweringInfo &Libcalls, Function *F,
                            DomTreeUpdater *DTU, bool &HasPrologue,
                            bool &HasIRCheck) {
-  	auto *M = F->getParent(); // get the module containing the function
-
 	VarGuardSlotMap SlotMap;
 	//VarGuardLayoutInfo::VarGuardObjectInfo STInfo;
 	// VarGuardLayoutInfo::ProtectedObject Pvg;
-  	AllocaInst *pAI = nullptr; // Place on stack that stores the stack guard.
 	std::vector<AllocaInst*> toRemove;
 
 	// it walks through every basic block in the function
@@ -922,7 +860,6 @@ static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
 			// auto *AllocaI = cast<AllocaInst>(&Inst);
 				if (AllocaI->getMetadata("varguard.protect")) {
 					// errs() << "alloca varguard proted\n";
-					AllocaInst *AI = nullptr;
 					Value *BufPtr = nullptr;
 					Value *CanaryPtr = nullptr;
 					if (!WrapAllocaWithVarGuardStruct(TLI, Libcalls, F, AllocaI, BufPtr, CanaryPtr))
