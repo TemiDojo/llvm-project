@@ -218,7 +218,7 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
 	// read check
 	//InsertChecks(slotMap);
 	errs() << "calling insert checks\n";
-	bool changed = InsertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, slotMap);
+	InsertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, slotMap);
 
 	
 	
@@ -533,34 +533,6 @@ static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
 }
 
 
-/// Search for the first call to the llvm.stackprotector intrinsic and return it
-/// if present.
-// It searched a function for this intrinsic: llvm.stackprotector
-// that intrinsici represents LLVM stack protector prologue marker/checker setup
-// if it finds one, it returns the call instruction
-/*
- * This exists because InsertVarGuards may need to recover the stack guard slot that was created 
- * earlier. So it searches for the existing llvm.stackprotector call and extracts its argument.
- * This basically answers- has this function already been given a stack protection intrinsic
- * what is an intrinsic?
- */
-static const CallInst *findVarGuardIntrinsic(Function &F) {
-	// loop over basic block in the function.
-  	for (const BasicBlock &BB : F)
-		// loop over every instruction in that basic block
-    	for (const Instruction &I : BB)
-			// try to cast the instruction to an IntrinsicInst.
-			// An intrinsic is a special LLVM built-in function-like operation
-      		if (const auto *II = dyn_cast<IntrinsicInst>(&I))
-				// Check whether this intrinsic is specifically the stack protector intrinsic.
-        		if (II->getIntrinsicID() == Intrinsic::stackprotector)
-					// return it immediately
-          			return II;
-	// if nothing matched, return null
-	return nullptr;
-}
-
-
 /// Check whether or not this function needs a stack protector based
 /// upon the stack protector level.
 ///
@@ -649,14 +621,14 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
 					// [7] means capture surrounding variables by reference.
 					// It oes not emit immediately. It prepares a message taht can beemitted later with
 					// ORE.emit...
-          			auto RemarkBuilder = [&]() {
-            			return OptimizationRemark(DEBUG_TYPE, "VarGuardAllocaOrArray",
-                                      &I)
-                   			<< "Var Guard applied to variable "
-                   			<< ore::NV("Function", F)
-                   			<< " due to a call to alloca or use of a variable length "
-                      			"array";
-          			};
+          			// auto RemarkBuilder = [&]() {
+          			// 		return OptimizationRemark(DEBUG_TYPE, "VarGuardAllocaOrArray",
+          			//                          &I)
+          			//       			<< "Var Guard applied to variable "
+          			//       			<< ore::NV("Function", F)
+          			//       			<< " due to a call to alloca or use of a variable length "
+          			//          			"array";
+          			// };
 					// is the array size known at compile time?, if yes, CI is the constant integer.
           			if (auto *CI = dyn_cast<ConstantInt>(AI->getArraySize())) {
 						// if allocation count is at least the threshold, protect it.
@@ -842,6 +814,41 @@ static bool CreateVarGuardPrologue(Function *F, Module *M, AllocaInst *guardA,
 		return false;
 
 	return true;
+static bool WrapAllocaWithVarGuardStruct(const TargetLowering &TLI, 
+							const LibcallLoweringInfo &Libcalls, Function *F,
+							AllocaInst *OldAI, Value *&BufPtr, Value *&CanaryPtr) {
+	LLVMContext &Ctx = F->getContext();
+	IRBuilder<> B(OldAI);
+
+	Type *BufTy = OldAI->getAllocatedType();
+
+	PointerType *CanaryTy = PointerType::getUnqual(Ctx);
+
+	Value *GuardPtr = TLI.getIRStackGuard(B, Libcalls);
+	if (!GuardPtr)
+		return false;
+	StructType *VGStructTy = StructType::create(Ctx, {BufTy, CanaryTy}, "varguard.struct");
+
+	AllocaInst *StructAI = B.CreateAlloca(VGStructTy, nullptr, "varguard.obj");
+	
+	CanaryPtr = B.CreateStructGEP(VGStructTy, StructAI, 1, "vg.canary.ptr");
+	BufPtr = B.CreateStructGEP(VGStructTy, StructAI, 0, "vg.buf.ptr");
+	
+	Value *Guardslot = B.CreateLoad(B.getPtrTy(), GuardPtr, true, "VarGuard");
+	B.CreateStore(Guardslot, CanaryPtr, true);
+	
+	OldAI->replaceUsesWithIf(BufPtr, [](Use &U) -> bool {
+        auto const *const user = U.getUser();
+        if (auto const *const CI = dyn_cast<CallInst>(user)) {
+            return !CI->isLifetimeStartOrEnd();
+        }
+        return true;
+    });
+	OldAI->replaceAllUsesWith(StructAI);
+
+	return true;
+
+
 }
 
 /*
@@ -857,10 +864,11 @@ static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
                            const LibcallLoweringInfo &Libcalls, Function *F,
                            DomTreeUpdater *DTU, bool &HasPrologue,
                            bool &HasIRCheck) {
-  	auto *M = F->getParent(); // get the module containing the function
-
 	VarGuardSlotMap SlotMap;
   	AllocaInst *pAI = nullptr; // Place on stack that stores the stack guard.
+	//VarGuardLayoutInfo::VarGuardObjectInfo STInfo;
+	// VarGuardLayoutInfo::ProtectedObject Pvg;
+	std::vector<AllocaInst*> toRemove;
 
 	// it walks through every basic block in the function
 	// make_early_inc_range is important because this pass may modify the function while looping
@@ -881,6 +889,12 @@ static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
 						// errs() << "Protected alloca: " << *AllocaI << "\n";
 						// errs() << "Guard slot: " << *AI << "\n";
 					}
+					Value *BufPtr = nullptr;
+					Value *CanaryPtr = nullptr;
+					if (!WrapAllocaWithVarGuardStruct(TLI, Libcalls, F, AllocaI, BufPtr, CanaryPtr))
+						continue;
+					toRemove.push_back(AllocaI);
+					SlotMap[BufPtr] = CanaryPtr;
 				}
 			}
 		}
