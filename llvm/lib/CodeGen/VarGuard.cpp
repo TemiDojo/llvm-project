@@ -81,8 +81,9 @@ static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
                                        bool &HasPrologue, bool &HasIRCheck);
 // static VarGuardSlotMap InsertVarGuards(const TargetLowering &TLI,
 // 									const
-// LibcallLoweringInfo &Libcalls, 									Function *F, DomTreeUpdater *DTU, 									bool
-// &HasPrologue, bool &HasIRCheck, VarGuardLayoutInfo::ProtectedObject);
+// LibcallLoweringInfo &Libcalls,
+// Function *F, DomTreeUpdater *DTU,
+// bool &HasPrologue, bool &HasIRCheck, VarGuardLayoutInfo::ProtectedObject);
 static BasicBlock *CreateVarGuardFailBB(Function *F,
                                         const LibcallLoweringInfo &Libcalls);
 static bool InsertChecks(const TargetLowering &TLI,
@@ -106,8 +107,8 @@ static bool WrapAllocaWithVarGuardStruct(const TargetLowering &TLI,
 // declared inside class VarGuardLayoutInfo
 // :: mean this functin belongs to VarGuardLayoutInfo
 // const at the end means thsi method will not modify the VarGuardLayoutInfo
-// object There are two possible places to emit the stack protector check: 		IR
-// pass emits it now or backend/selectiondag emits it later
+// object There are two possible places to emit the stack protector check:
+// IR pass emits it now or backend/selectiondag emits it later
 bool VarGuardLayoutInfo::shouldEmitVGCheck(const BasicBlock &BB) const {
   return HasPrologue && !HasIRCheck && isa<ReturnInst>(BB.getTerminator());
 }
@@ -695,8 +696,8 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
               // Remember that this function needs protection.
               // Layout->insert(
               // 				std::make_pair(AI,
-              // MachineFrameInfo::SSPLK_LargeArray)); 		ORE.emit(RemarkBuilder);
-              // attach a metada to the IR here?
+              // MachineFrameInfo::SSPLK_LargeArray));
+              // ORE.emit(RemarkBuilder); attach a metada to the IR here?
               LLVMContext &Ctx = F->getContext();
               MDNode *N = MDNode::get(Ctx, MDString::get(Ctx, ""));
               AI->setMetadata("varguard.protect", N);
