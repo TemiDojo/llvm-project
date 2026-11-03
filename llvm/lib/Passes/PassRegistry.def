@@ -385,7 +385,7 @@ FUNCTION_ANALYSIS("should-not-run-function-passes",
 FUNCTION_ANALYSIS("should-run-extra-vector-passes",
                   ShouldRunExtraVectorPasses())
 FUNCTION_ANALYSIS("ssp-layout", SSPLayoutAnalysis())
-FUNCTION_ANALYSIS("varguard-layout", VarGuardLayoutAnalysis())
+FUNCTION_ANALYSIS("ssp-layout", VarGuardLayoutAnalysis())
 FUNCTION_ANALYSIS("stack-safety-local", StackSafetyAnalysis())
 FUNCTION_ANALYSIS("target-ir",
                   TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis())
@@ -552,6 +552,7 @@ FUNCTION_PASS("sjlj-eh-prepare", SjLjEHPreparePass(TM))
 FUNCTION_PASS("slp-vectorizer", SLPVectorizerPass())
 FUNCTION_PASS("slsr", StraightLineStrengthReducePass())
 FUNCTION_PASS("stack-protector", StackProtectorPass(*TM))
+FUNCTION_PASS("var-guard", VarGuardPass(*TM))
 FUNCTION_PASS("strip-convergence-intrinsics", StripConvergenceIntrinsicsPass())
 FUNCTION_PASS("strip-gc-relocates", StripGCRelocates())
 FUNCTION_PASS("tailcallelim", TailCallElimPass())
@@ -579,7 +580,6 @@ FUNCTION_PASS("view-post-dom", PostDomViewer())
 FUNCTION_PASS("view-post-dom-only", PostDomOnlyViewer())
 FUNCTION_PASS("win-eh-prepare", WinEHPreparePass())
 FUNCTION_PASS("wasm-eh-prepare", WasmEHPreparePass())
-FUNCTION_PASS("var-guard", VarGuardPass(*TM))
 #undef FUNCTION_PASS
 
 #ifndef FUNCTION_PASS_WITH_PARAMS

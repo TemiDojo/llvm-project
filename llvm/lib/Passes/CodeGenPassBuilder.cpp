@@ -94,6 +94,7 @@
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/CodeGen/TwoAddressInstructionPass.h"
 #include "llvm/CodeGen/UnreachableBlockElim.h"
+#include "llvm/CodeGen/VarGuard.h"
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/CodeGen/WasmEHPrepare.h"
 #include "llvm/CodeGen/WinEHPrepare.h"
@@ -514,6 +515,7 @@ void CodeGenPassBuilder::addISelPrepare(PassManagerWrapper &PMW) {
   // only protect functions that have corresponding attributes.
   addFunctionPass(SafeStackPass(TM), PMW);
   addFunctionPass(StackProtectorPass(TM), PMW);
+  addFunctionPass(VarGuardPass(TM), PMW);
 
   if (Opt.PrintISelInput)
     addFunctionPass(PrintFunctionPass(

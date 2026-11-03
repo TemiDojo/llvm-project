@@ -64,7 +64,7 @@ public:
                                VarGuardLayoutMap *Layout = nullptr);
 };
 
-class VarGuardPass : public PassInfoMixin<VarGuardPass> {
+class VarGuardPass : public RequiredPassInfoMixin<VarGuardPass> {
   const TargetMachine *TM;
 
 public:
