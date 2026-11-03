@@ -1,18 +1,19 @@
+#include "llvm/CodeGen/VarGuard.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
+#include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/Analysis.h"
 #include "llvm/CodeGen/Passes.h"
-#include "llvm/CodeGen/StackProtector.h"
 #include "llvm/CodeGen/TargetLowering.h"
-#include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/EHPersonalities.h"
@@ -20,18 +21,14 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/User.h"
-#include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <optional>
 
@@ -47,7 +44,7 @@ using namespace llvm;
 STATISTIC(NumFunProtected, "Number of functions protected");
 STATISTIC(NumAddrTaken,
           "Number of local variables that have their address taken");
-STATISTIC(NumVarProtected, "Number of variables protected");
+// STATISTIC(NumVarProtected, "Number of variables protected");
 
 using VarGuardSlotMap =
     DenseMap<Instruction *, AllocaInst *>;
@@ -103,54 +100,33 @@ bool VarGuardLayoutInfo::shouldEmitVGCheck(const BasicBlock &BB) const {
  * VarGuardLayoutAnalysis marked? if yes, it stores the stack-protector category
  * into MachineFrameInfo
  */
-
 void VarGuardLayoutInfo::copyToVGMachineFrameInfo(MachineFrameInfo &MFI) const {
-  // if no allocas were marked, there is nothing to copy
   if (Layout.empty())
     return;
-  // loop over backend frame object indices, I is a frame index
+
   for (int I = 0, E = MFI.getObjectIndexEnd(); I != E; ++I) {
-    // skip tack objects that no longer exists or are unused
-    // what are stack objects?
     if (MFI.isDeadObjectIndex(I))
       continue;
-    // which llvm IR alloca created this stack object
+
     const AllocaInst *AI = MFI.getObjectAllocation(I);
-    // if no alloca is associated:
-    // skip it
     if (!AI)
       continue;
 
-    // Look up that alloca in the SSP layout map
     VarGuardLayoutMap::const_iterator LI = Layout.find(AI);
-    // if the alloca was not marked by stack-protector analysis, skip it
     if (LI == Layout.end())
       continue;
-    // this tells the backend frame info:
-    // 		Frame object I has SSP layout kind LI->second
-    // 	example of layout kinds are things like: large array, small array,
-    // address-taken object
+
     MFI.setObjectSSPLayout(I, LI->second);
   }
 }
 
-// This is the analysis pass. it computes: does this function need stack
-// protection? which allocas matter? what buffer size threshold is being used?
-// This defines the run() method for the VarGuardLayoutAnalysis class. so every
-// class in llvm need a run function? This analysis returns an
-// VarGuardLayoutInfo object.
 VarGuardLayoutInfo VarGuardLayoutAnalysis::run(Function &F,
                                                FunctionAnalysisManager &FAM) {
-  // create an empty result object
   VarGuardLayoutInfo Info;
-  // returns t/f: does F need stack protection?
-  // fills Info.Layout with dangerous allocas
   Info.RequireVarGuard =
       VarGuardLayoutAnalysis::requiresVarGuard(&F, &Info.Layout);
-  // Reads teh function attribute, if missing use default 8.
   Info.VarGuardBufferSize = F.getFnAttributeAsParsedInteger(
       "stack-protector-buffer-size", VarGuardLayoutInfo::DefaultVGBufferSize);
-  // returns the completed analysis
   return Info;
 }
 
@@ -241,167 +217,45 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
 	return PA;
 }
 
-// this defines the static ID declared in the header
-char VarGuard::ID = 0;
-// This is the constructor: Define the constructor for class StackProtector
-// : is the initializer list
-// : FunctionPass(ID) meaning call the parent class constructor FunctionPass
-// with ID so this says create a legacy FunctionPass named StackProtector.
-VarGuard::VarGuard() : FunctionPass(ID) {}
-
-// These are LLVM macros for registering the legacy pass
-// its states: This passs is named stack-protector.
-// 		It depends on: LibcallLowringInofoWrapper
-// 		TargetPassConfig
-// 		DominatorTreeWrapperPass
-INITIALIZE_PASS_BEGIN(VarGuard, DEBUG_TYPE, "Insert stack protectors", false,
-                      true)
-INITIALIZE_PASS_DEPENDENCY(LibcallLoweringInfoWrapper);
-INITIALIZE_PASS_DEPENDENCY(TargetPassConfig);
-INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass);
-INITIALIZE_PASS_END(VarGuard, DEBUG_TYPE, "Insert stack protectors", false,
-                    true)
-
-// This is a factory function, create and return a new StackProtector legacy
-// pass object return type is FunctionPass * means poitner to a legacy function
-// pass.
-FunctionPass *llvm::createVarGuardPass() { return new VarGuard(); }
-
-// This just tells llvm (old pass manager):
-// what analyses do I need? what analyses do I preserve
-void VarGuard::getAnalysisUsage(AnalysisUsage &AU) const {
-  // Ined libcall lowering info before I run
-  AU.addRequired<LibcallLoweringInfoWrapper>();
-  // I need access to TargetMachine/backend config
-  AU.addRequired<TargetPassConfig>();
-  // I primise I will keep the dominator tree valid
-  AU.addPreserved<DominatorTreeWrapperPass>();
-}
-
-// legacy equivalent of PreservedAnalyses... run
-bool VarGuard::runOnFunction(Function &Fn) {
-
-  F = &Fn;            // F -> current function
-  M = F->getParent(); // M -> module containing the function
-  // auto *DTWP: type is infered automatically
-  // getAnalysisIfAvailable<T>(): if dominatortree exists, give it to me. if not
-  // return null. DTU.empalce...so create DTU only if DominatorTree exists
-  if (auto *DTWP = getAnalysisIfAvailable<DominatorTreeWrapperPass>())
-    DTU.emplace(DTWP->getDomTree(), DomTreeUpdater::UpdateStrategy::Lazy);
-  // get targetmachine from targetpassconfig - this is how the legacy pass
-  // accesses backend info.
-  TM = &getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
-  // clear previous state
-  LayoutInfo.HasPrologue = false;
-  LayoutInfo.HasIRCheck = false;
-
-  // read function attribute or use default
-  LayoutInfo.VarGuardBufferSize = Fn.getFnAttributeAsParsedInteger(
-      "stack-protector-buffer-size", VarGuardLayoutInfo::DefaultVGBufferSize);
-  // if function does not need protection -> do nothing
-  if (!requiresVarGuard(F, &LayoutInfo.Layout))
-    return false;
-
-  // TODO(etienneb): Functions with funclets are not correctly supported now.
-  // Do nothing if this is funclet-based personality.
-  if (Fn.hasPersonalityFn()) {
-    EHPersonality Personality = classifyEHPersonality(Fn.getPersonalityFn());
-    if (isFuncletEHPersonality(Personality))
-      return false;
-  }
-  // per fuction target info
-  const TargetSubtargetInfo *Subtarget = TM->getSubtargetImpl(Fn);
-  // get runtime call lowering rules
-  const LibcallLoweringInfo &Libcalls =
-      getAnalysis<LibcallLoweringInfoWrapper>().getLibcallLowering(*M,
-                                                                   *Subtarget);
-  // get lowering rules
-  const TargetLowering *TLI = Subtarget->getTargetLowering();
-  // increment statistic
-  ++NumFunProtected;
-  // same as new pass: call the core function that inserts stack protector logic
-  // DUT ? &*DTU : nullptr -> if DTU exists -> pass pointer to it else -> pass
-  // null
-  VarGuardSlotMap slotMap =
-      InsertVarGuards(*TLI, Libcalls, F, DTU ? &*DTU : nullptr,
-                      LayoutInfo.HasPrologue, LayoutInfo.HasIRCheck);
-  bool Changed = !slotMap.empty();
-
-  // debug verification: verify if dominator tree if enabled
-#ifdef EXPENSIVE_CHECKS
-  assert((!DTU ||
-          DTU->getDomTree().verify(DominatorTree::VerificationLevel::Full)) &&
-         "Failed to maintain validity of domtree!");
-#endif
-  // destroy the optional DomTreeUpdater
-  DTU.reset();
-  return Changed;
-}
-
-// does this LLVM Type contain an array that should trigger protection?
-// Type *Ty:the type being inspected, the modules, used for target/data-layout
-// info threshold size usually 8 bytes, outputs parameter. The & means
-// reference, so changes inside the functin affects the caller's variable,
-// whether strong stack protection mode is enabled, whether we are currently
-// checking a type nested insdie a struct.
-/* Type
- ├─ array?
- │   ├─ large enough?
- │   └─ strong mode?
- └─ struct?
-     └─ check each field
-         */
-static bool ContainsGuardableArray(Type *Ty, Module *M,
+/// \param [out] IsLarge is set to true if a protectable array is found and
+/// it is "large" ( >= vg-buffer-size).  In the case of a structure with
+/// multiple arrays, this gets set if any of them is large.
+static bool containsGuardableArray(Type *Ty, Module *M,
                                    unsigned VarGuardBufferSize, bool &IsLarge,
                                    bool Strong, bool InStruct) {
-  // if ther is not type, it cannot contain a protectable array
   if (!Ty)
     return false;
-  // if Ty is actually an ArrayType, treat it as ArrayType and enter this block
-  // dyn_cat<T>(x) is LLVM's safe runtime cast.
   if (ArrayType *AT = dyn_cast<ArrayType>(Ty)) {
-    // if this not an i8 array, in llvm, char is usually i8.
     if (!AT->getElementType()->isIntegerTy(8)) {
       // If we're on a non-Darwin platform or we're inside of a structure, don't
       // add stack protectors unless the array is a character array.
       // However, in strong mode any array, regardless of type and size,
       // triggers a protector.
-      // In normal mode: non-char arrays usually do not trigger protection
-      // especially inside structs or non-Darwin targets, but in sting mode,
-      // more arrays count
       if (!Strong && (InStruct || !M->getTargetTriple().isOSDarwin()))
         return false;
     }
 
     // If an array has more than VarGuardBufferSize bytes of allocated space,
-    // then we emit stack protectors. This asks, is this array at least
-    // VarGuardBufferSize bytes in memory? if yest this a large protectable
-    // array, so it sets IsLarge to true
+    // then we emit stack protectors.
     if (VarGuardBufferSize <= M->getDataLayout().getTypeAllocSize(AT)) {
       IsLarge = true;
       return true;
     }
 
-    // In strong mode, even small arrays can trigger protection.
     if (Strong)
-      // Require a protector for all arrays in strong mode
       return true;
   }
-  // If it is not a struct, and not a protectable array, return false.
   const StructType *ST = dyn_cast<StructType>(Ty);
   if (!ST)
     return false;
-  // Loop over each filed type inside the struct.
+
   bool NeedsProtector = false;
   for (Type *ET : ST->elements())
-    // check whether this struct field contains a protectable array.
-    // notice the last argument, now we're inside a struct
-    if (ContainsGuardableArray(ET, M, VarGuardBufferSize, IsLarge, Strong,
+    if (containsGuardableArray(ET, M, VarGuardBufferSize, IsLarge, Strong,
                                true)) {
       // If the element is a protectable array and is large (>=
       // VarGuardBufferSize) then we are done.  If the protectable array is not
       // large, then keep looking in case a subsequent element is a large array.
-      // if large array is found
       if (IsLarge)
         return true;
       NeedsProtector = true;
@@ -410,56 +264,30 @@ static bool ContainsGuardableArray(Type *Ty, Module *M,
   return NeedsProtector;
 }
 
-// This supports the next helper, HasAddressTaken
-// Did the address of this stack variable escape or get used dangerously?
-struct PhiInfo {             // defines a small helper object
-  TypeSize AllocSize;        // stores the remaining known allocation size
-  unsigned NumDecreased = 0; // tracks how many times llvm has reduces teh known
-                             // safe size while following pointer uses
-  // A compile time constant: only alow the tracked size to shrink a few times
-  // before giving up why? to avaoid infinite or very expensive recursion
-  // thorugh complicated PHI cycles.
+/// Maximum remaining allocation size observed for a phi node, and how often
+/// the allocation size has already been decreased. We only allow a limited
+/// number of decreases.
+struct PhiInfo {
+  TypeSize AllocSize;
+  unsigned NumDecreased = 0;
   static constexpr unsigned MaxNumDecreased = 3;
-  // contructor, after : is an initializer list
-  // meaning initialzie the member AllocSize using the constructor parameter
-  // AllocSize.
   PhiInfo(TypeSize AllocSize) : AllocSize(AllocSize) {}
 };
-// This create a type alias
 using PhiMap = SmallDenseMap<const PHINode *, PhiInfo, 16>;
-// A PHINode is an SSA instruction that selects a value depending on which
-// predecessor block control came from. This section exists becaues
-// HasAddressTaken recursively follows users of an alloca
 
 /// Check whether a stack allocation has its address taken.
-// does this stack allocation's address get used in a way that could escape or
-// be unsafe?
-static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
+static bool hasAddressTaken(const Instruction *AI, TypeSize AllocSize,
                             Module *M, PhiMap &VisitedPHIs) {
-  // gets size/layout rules for the target
-  // how many bytes does this type occupy?
-  // what offset does this GEP produce? what is GEP?
   const DataLayout &DL = M->getDataLayout();
-  // for every instruction/user that uses this allocation pointer
   for (const User *U : AI->users()) {
-    // Treat the user as an instruction
-    // LLVM checked/assumed this is definitely type T.
-    // if not, assert/crash in debug builds.
     const auto *I = cast<Instruction>(U);
     // If this instruction accesses memory make sure it doesn't access beyond
     // the bounds of the allocated object.
-    /// If this instruction access memory, and LLVM knows the size, and the
-    /// access may exceed the allocation size, then treat it as dangerous.
-    /// So access bigger than object -> address considered risky.
     std::optional<MemoryLocation> MemLoc = MemoryLocation::getOrNone(I);
     if (MemLoc && MemLoc->Size.hasValue() &&
         !TypeSize::isKnownGE(AllocSize, MemLoc->Size.getValue()))
       return true;
-    // this checks what kinds of instruction is using the pointer.
-    // the function classifies uses into safe, unsafe, follow recursively.
     switch (I->getOpcode()) {
-      // if the alloca pointer itself is being stored somewhere, its address
-      // escaped
     case Instruction::Store:
       if (AI == cast<StoreInst>(I)->getValueOperand())
         return true;
@@ -479,7 +307,6 @@ static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
       if (AI == cast<PtrToIntInst>(I)->getOperand(0))
         return true;
       break;
-      // If passed to a real call, usually unsafe.
     case Instruction::Call: {
       // Ignore intrinsics that do not become real instructions.
       // TODO: Narrow this to intrinsics that have store-like effects.
@@ -490,9 +317,6 @@ static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
     }
     case Instruction::Invoke:
       return true;
-      // A GEP computes a derived pointer. LLVM tries to prove the derived
-      // pointer stays in bounds. If not, unsafe. If yes, recursively follow the
-      // GEP's users.
     case Instruction::GetElementPtr: {
       // If the GEP offset is out-of-bounds, or is non-constant and so has to be
       // assumed to be potentially out-of-bounds, then any memory access that
@@ -511,18 +335,16 @@ static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
       // assume the scalable value is of minimum size.
       TypeSize NewAllocSize =
           TypeSize::getFixed(AllocSize.getKnownMinValue()) - OffsetSize;
-      if (HasAddressTaken(I, NewAllocSize, M, VisitedPHIs))
+      if (hasAddressTaken(I, NewAllocSize, M, VisitedPHIs))
         return true;
       break;
     }
-      // These created derived pointer values. Recursively follow them
     case Instruction::BitCast:
     case Instruction::Select:
     case Instruction::AddrSpaceCast:
-      if (HasAddressTaken(I, AllocSize, M, VisitedPHIs))
+      if (hasAddressTaken(I, AllocSize, M, VisitedPHIs))
         return true;
       break;
-      // Track it in VisitedPhis, then recursively follow it
     case Instruction::PHI: {
       // Keep track of what PHI nodes we have already visited to ensure
       // they are only visited once.
@@ -539,11 +361,10 @@ static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
         It->second.AllocSize = AllocSize;
         ++It->second.NumDecreased;
       }
-      if (HasAddressTaken(PN, AllocSize, M, VisitedPHIs))
+      if (hasAddressTaken(PN, AllocSize, M, VisitedPHIs))
         return true;
       break;
     }
-      // These are treated as not triggering stack protector here.
     case Instruction::Load:
     case Instruction::Ret:
       // These instructions take an address operand, but have load-like or
@@ -571,28 +392,20 @@ static bool HasAddressTaken(const Instruction *AI, TypeSize AllocSize,
 /// regardless of type and size, functions with aggregates that contain any
 /// buffer regardless of type and size, and functions that contain stack-based
 /// variables that have had their address taken.
-/*
- * This is the decision function. It asks does this fucntion need stack
- * protection? and optionally fills which allocas causes protection. retursn
- * true or false
- */
 bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
                                               VarGuardLayoutMap *Layout) {
-  Module *M = F->getParent(); // module containing the function
-  bool Strong = true;         // are we in strong stack-protector mode
-  bool NeedsProtector = true; // final answer being built
+  Module *M = F->getParent();
+  bool Strong = true;
+  bool NeedsProtector = true;
 
   // The set of PHI nodes visited when determining if a variable's reference has
   // been taken.  This set is maintained to ensure we don't visit the same PHI
   // node multiple times.
-  PhiMap VisitedPHIs; // used by HasAddressTaken
-  // This reads the function attribute, if absent, use default size 8
-  // so this controls how large must a buffer be before normal stack protection
-  // triggers?
+  PhiMap VisitedPHIs;
+
   unsigned VarGuardBufferSize = F->getFnAttributeAsParsedInteger(
       "var-guard-buffer-size", VarGuardLayoutInfo::DefaultVGBufferSize);
-  // if function uses safestack, this stack protector pass not protect it here
-  // what is safestack?
+
   if (F->hasFnAttribute(Attribute::SafeStack))
     return false;
 
@@ -601,95 +414,40 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
   // are not available this late in the IR pipeline.
   // creates an object for emitting remarking...
   OptimizationRemarkEmitter ORE(F);
-  // if stack protection is explicityly required
-  //  	if (F->hasFnAttribute(Attribute::StackProtectReq)) {
-  // 	// if caller only wants yes/no, return immediately.
-  //    	if (!Layout)
-  //      		return true;
-  // 	// otherwise emit a remark
-  //    	ORE.emit([&]() {
-  //      	return OptimizationRemark(DEBUG_TYPE, "VarGuardRequested", F)
-  //        	<< "Var Guard applied to variable "
-  //            << ore::NV("Function", F)
-  //            << " due to a function attribute or command-line switch";
-  //    	});
-  // 	// use strong layout classification
-  //    	NeedsProtector = true;
-  //    	Strong = true; // Use the same heuristic as strong to determine
-  //    SSPLayout
-  // // if strong protection attribute exists
-  //  	} else if (F->hasFnAttribute(Attribute::StackProtectStrong))
-  // 	// use strong mode
-  //    	Strong = true;
-  // // else if normal stack protection is not enabled
-  //  	else if (!F->hasFnAttribute(Attribute::StackProtect))
-  // 	// no protection
-  //    	return false;
-  // F is pointer, so *F dereferences it to get the actual Function
-  // loop iterate over the function's basic block
+
   for (BasicBlock &BB : *F) {
-    // loop over instructions inside that basic block
     for (Instruction &I : BB) {
-      // Try to cast instruction I into an AllocaInst
-      // If it is an alloca, AI is non-null and the block runs.
-      // if not skip
       if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
-        // this checks for metadata attached to the alloca
-        // m? if this alloca has stack-protector metadata set to 0, skip it.
-        if (MDNode *MD = AI->getMetadata("stack-protector")) {
+
+        if (MDNode *MD = AI->getMetadata("var-guard")) {
           auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
           if (CI->isZero())
             continue;
-          // llvm allows specific allocs to opt out of stack protector
-          // consideration. why?
         }
-        // this checks dynamic or repeated allocation size.
-        // runtime dependent allocation
+
         if (AI->isArrayAllocation()) {
-          // this creates a labda taht builds the optimization remark
-          // [7] means capture surrounding variables by reference.
-          // It oes not emit immediately. It prepares a message taht can
-          // beemitted later with ORE.emit...
-          // auto RemarkBuilder = [&]() {
-          // 		return OptimizationRemark(DEBUG_TYPE,
-          // "VarGuardAllocaOrArray",
-          //                          &I)
-          //       			<< "Var Guard applied to variable "
-          //       			<< ore::NV("Function", F)
-          //       			<< " due to a call to alloca or use of a
-          //       variable length "
-          //          			"array";
-          // };
-          // is the array size known at compile time?, if yes, CI is the
-          // constant integer.
+
           if (auto *CI = dyn_cast<ConstantInt>(AI->getArraySize())) {
-            // if allocation count is at least the threshold, protect it.
+
             if (CI->getLimitedValue(VarGuardBufferSize) >= VarGuardBufferSize) {
               // A call to alloca with size >= VarGuardBufferSize requires
               // stack protectors.
               // if caller only wants yes or no, return immmediately
               if (!Layout)
                 return true;
-              // mark this alloca as a large array. Emit remark.
-              // Remember that this function needs protection.
-              // Layout->insert(
-              // 				std::make_pair(AI,
-              // MachineFrameInfo::SSPLK_LargeArray));
-              // ORE.emit(RemarkBuilder); attach a metada to the IR here?
+              Layout->insert(
+                  std::make_pair(AI, MachineFrameInfo::SSPLK_LargeArray));
               LLVMContext &Ctx = F->getContext();
               MDNode *N = MDNode::get(Ctx, MDString::get(Ctx, ""));
               AI->setMetadata("varguard.protect", N);
               NeedsProtector = true;
-              // if size is below threshold but strong mode is enabled.
+
             } else if (Strong) {
               // Require protectors for all alloca calls in strong mode.
               if (!Layout)
                 return true;
-              // mark as small array
-              // Layout->insert(
-              // 				std::make_pair(AI,
-              // MachineFrameInfo::SSPLK_SmallArray)); 	ORE.emit(RemarkBuilder);
-              // attach a metada to the IR here?
+              Layout->insert(
+                  std::make_pair(AI, MachineFrameInfo::SSPLK_SmallArray));
               LLVMContext &Ctx = F->getContext();
               MDNode *N = MDNode::get(Ctx, MDString::get(Ctx, ""));
               AI->setMetadata("varguard.protect", N);
@@ -697,16 +455,10 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
             }
           } else {
             // A call to alloca with a variable size requires protectors.
-            // this is the size not known at compile time case
-            // if getArraySize() is not a constantInt, LLVM treatse it as
-            // dangerous
             if (!Layout)
               return true;
-            // Layout->insert(
-            //  			std::make_pair(AI,
-            //  MachineFrameInfo::SSPLK_LargeArray));
-            // 		ORE.emit(RemarkBuilder);
-            // attach metadata to the IR
+            Layout->insert(
+                std::make_pair(AI, MachineFrameInfo::SSPLK_LargeArray));
             LLVMContext &Ctx = F->getContext();
             MDNode *N = MDNode::get(Ctx, MDString::get(Ctx, ""));
             AI->setMetadata("varguard.protect", N);
@@ -714,61 +466,33 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
           }
           continue;
         }
-        // output flag
+
         bool IsLarge = false;
-        // recursively checks if this type contain a buffertaht should trigger
-        // stack protection?
-        if (ContainsGuardableArray(AI->getAllocatedType(), M,
+        if (containsGuardableArray(AI->getAllocatedType(), M,
                                    VarGuardBufferSize, IsLarge, Strong,
                                    false)) {
           if (!Layout)
             return true;
-          // if buffer is large, mark alloc as large array
-          // else mark alloca as small array
-          // condition ? value_if_true : value_if_false
-          // Layout->insert(std::make_pair(
-          //  	AI, IsLarge ? MachineFrameInfo::SSPLK_LargeArray
-          //                : MachineFrameInfo::SSPLK_SmallArray));
-          ORE.emit([&]() {
-            return OptimizationRemark(DEBUG_TYPE, "VarGuardBuffer", &I)
-                   << "Var Guard applied to  variable" << ore::NV("Function", F)
-                   << " due to a stack allocated buffer or struct containing a "
-                      "buffer";
-          });
-          // attach metadata to the IR
+          Layout->insert(
+              std::make_pair(AI, IsLarge ? MachineFrameInfo::SSPLK_LargeArray
+                                         : MachineFrameInfo::SSPLK_SmallArray));
           LLVMContext &Ctx = F->getContext();
           MDNode *N = MDNode::get(Ctx, MDString::get(Ctx, ""));
           AI->setMetadata("varguard.protect", N);
           NeedsProtector = true;
-          // move to the next instruction
           continue;
         }
-        // this runs only in strong
+
         if (Strong) {
           // can you compute the size of this alloc?
           std::optional<TypeSize> AllocSize =
               AI->getAllocationSize(M->getDataLayout());
-          // !AllocSize = maybe there is a size, maybe not. llvm could not
-          // determine the size HasAddressTaken...= Does thsi alloca's
-          // addressescape or get used dagerously. *AllocSize unwraps the
-          // optional value of size is unkown OR address is taken, treat it as
-          // needing protection
-          if (!AllocSize || HasAddressTaken(AI, *AllocSize, M, VisitedPHIs)) {
-            // increment statistic
+          if (!AllocSize || hasAddressTaken(AI, *AllocSize, M, VisitedPHIs)) {
             ++NumAddrTaken;
             if (!Layout)
               return true;
-            // Layout->insert(std::make_pair(AI,
-            // MachineFrameInfo::SSPLK_AddrOf));
-            ORE.emit([&]() {
-              return OptimizationRemark(DEBUG_TYPE,
-                                        "StackProtectorAddressTaken", &I)
-                     << "Stack protection applied to function "
-                     << ore::NV("Function", F)
-                     << " due to the address of a local variable being taken";
-            });
+            Layout->insert(std::make_pair(AI, MachineFrameInfo::SSPLK_AddrOf));
 
-            // attach metadata to the IR
             LLVMContext &Ctx = F->getContext();
             MDNode *N = MDNode::get(Ctx, MDString::get(Ctx, ""));
             AI->setMetadata("varguard.protect", N);
@@ -777,10 +501,6 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
         }
         // Clear any PHIs that we visited, to make sure we examine all uses of
         // any subsequent allocas that we look at.
-        // This clears the PHI tracking set before checking next alloca.
-        // Why? The PHI recursion tracking is only for one alloca's use graph.
-        // You do not want visited PHI's from one variable affecting the next
-        // variabl
         VisitedPHIs.clear();
       }
     }
@@ -789,29 +509,16 @@ bool VarGuardLayoutAnalysis::requiresVarGuard(Function *F,
   return NeedsProtector;
 }
 
-/// Create a stack guard loading and populate whether SelectionDAG SSP is
-/// supported.
-// It gets the actual stack guard /canary value
-// IRBuilder<> &B -> helper object used to create LLVM IR instruction.
 static Value *getVarGuardValue(const TargetLoweringBase &TLI,
                                const LibcallLoweringInfo &Libcalls, Module *M,
-                               IRBuilder<> &B,
-                               bool *SupportsSelectionDAGSP = nullptr) {
-  // can you give me an IR-level way to access the stack guard
+                               IRBuilder<> &B) {
+
   Value *Guard = TLI.getIRStackGuard(B, Libcalls);
-  // reads module-level stack-protector guard mode
   StringRef GuardMode = M->getStackProtectorGuard();
-  // if guard mode is TLS/default and target gave us a guard pointer, load the
-  // canary value from it.
   if ((GuardMode == "tls" || GuardMode.empty()) && Guard) {
-    // B.CreateLoad... creates a new LLVM IR load instruction.
-    // AI = B.Create
-    errs() << "returning guard value \n";
     return B.CreateLoad(B.getPtrTy(), Guard, true, "VarGuard");
   }
 
-  if (SupportsSelectionDAGSP)
-    *SupportsSelectionDAGSP = true;
   return nullptr;
 }
 
@@ -892,8 +599,8 @@ static bool WrapAllocaWithVarGuardStruct(const TargetLowering &TLI,
   B.CreateStore(Guardslot, CanaryPtr, true);
 
   OldAI->replaceUsesWithIf(BufPtr, [](Use &U) -> bool {
-    auto const *const user = U.getUser();
-    if (auto const *const CI = dyn_cast<CallInst>(user)) {
+    auto const *const User = U.getUser();
+    if (auto const *const CI = dyn_cast<CallInst>(User)) {
       return !CI->isLifetimeStartOrEnd();
     }
     return true;
@@ -1061,11 +768,11 @@ static bool VisitUsesAndInsertChecks(const TargetLowering &TLI,
 }
 
 // Write
-static bool InsertChecks(const TargetLowering &TLI,
+static bool insertChecks(const TargetLowering &TLI,
                          const LibcallLoweringInfo &Libcalls, Function *F,
-                         DomTreeUpdater *DTU, VarGuardSlotMap slotMap) {
+                         DomTreeUpdater *DTU, VarGuardSlotMap SlotMap) {
 
-  bool changed = false;
+  bool Changed = false;
   BasicBlock *FailBB = nullptr;
 
 	errs() << "looping through slotMap\n";	
@@ -1077,11 +784,11 @@ static bool InsertChecks(const TargetLowering &TLI,
 		
 	}
 
-  return changed;
+  return Changed;
 }
 
 // This creates the failure block
-BasicBlock *CreateVarGuardFailBB(Function *F,
+BasicBlock *createVarGuardFailBb(Function *F,
                                  const LibcallLoweringInfo &Libcalls) {
   auto *M = F->getParent();
   LLVMContext &Context = F->getContext();
@@ -1105,7 +812,7 @@ BasicBlock *CreateVarGuardFailBB(Function *F,
         Type::getVoidTy(Context), PointerType::getUnqual(Context));
     Args.push_back(B.CreateGlobalString(F->getName(), "SSH"));
   } else {
-    Context.emitError("no libcall available for stack protector");
+    Context.emitError("no libcall available for var-guard");
   }
 
   if (StackChkFail) {
