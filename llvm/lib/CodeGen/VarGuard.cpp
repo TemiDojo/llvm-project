@@ -89,8 +89,6 @@ VarGuardLayoutInfo VarGuardLayoutAnalysis::run(Function &F,
 }
 
 AnalysisKey VarGuardLayoutAnalysis::Key;
-// FunctionAnalysisManager FAM;
-// FAM.registerPass([] {return VarGuardLayoutAnalysis();})
 
 PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
 
@@ -488,7 +486,6 @@ static VarGuardSlotMap insertVarGuards(const TargetLowering &TLI,
                                        const LibcallLoweringInfo &Libcalls,
                                        Function *F, DomTreeUpdater *DTU,
                                        bool &HasPrologue, bool &HasIRCheck) {
-  // auto *M = F->getParent();
   VarGuardSlotMap SlotMap;
   std::vector<AllocaInst *> ToRemove;
 
