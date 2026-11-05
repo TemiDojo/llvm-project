@@ -1,4 +1,5 @@
 #include "llvm/CodeGen/VarGuard.h"
+#include "llvm-c/Core.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
@@ -135,10 +136,10 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
                       Info.HasIRCheck);
 
   errs() << "calling insert checks\n";
-  insertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, SlotMap);
+  // insertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, SlotMap);
 
   PreservedAnalyses PA;
-  // PA.preserve<VarGuardLayoutAnalysis>();
+  PA.preserve<VarGuardLayoutAnalysis>();
   PA.preserve<DominatorTreeAnalysis>();
   return PA;
 }
@@ -487,22 +488,44 @@ static VarGuardSlotMap insertVarGuards(const TargetLowering &TLI,
                                        Function *F, DomTreeUpdater *DTU,
                                        bool &HasPrologue, bool &HasIRCheck) {
   VarGuardSlotMap SlotMap;
-  std::vector<AllocaInst *> ToRemove;
+
+  LLVMContext &Ctx = F->getContext();
+  SmallVector<Type *> StructVec{};
+  SmallVector<AllocaInst *> AllocVec{};
+
+  IRBuilder<> B(&F->getEntryBlock().front());
 
   for (BasicBlock &BB : llvm::make_early_inc_range(*F)) {
     for (auto &Inst : BB) {
       if (auto *AllocaI = dyn_cast<AllocaInst>(&Inst)) {
-        if (AllocaI->getMetadata("varguard.protect")) {
-          Value *BufPtr = nullptr;
-          Value *CanaryPtr = nullptr;
-          if (!wrapAllocaWithVarGuardStruct(TLI, Libcalls, F, AllocaI, BufPtr,
-                                            CanaryPtr))
-            continue;
-          ToRemove.push_back(AllocaI);
-          SlotMap[BufPtr] = CanaryPtr;
-        }
+        Type *AllocaType = AllocaI->getAllocatedType();
+        StructVec.push_back(AllocaType);
+        AllocVec.push_back(AllocaI);
       }
     }
+  }
+
+  ArrayRef<Type *> Test2(StructVec);
+  StructType *NewStructTy = StructType::create(Ctx, Test2, "varguardR-struct");
+  AllocaInst *NewStructAI =
+      B.CreateAlloca(NewStructTy, nullptr, "varguardR.obj");
+
+  unsigned StructIdx = 0;
+  SmallVector<Type *>::iterator It;
+
+  for (It = StructVec.begin(); It != StructVec.end(); ++It) {
+    Value *Vb = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
+                                  "vg.unsafe.alloca.ptr");
+    AllocVec[StructIdx]->replaceUsesWithIf(Vb, [](Use &U) -> bool {
+      auto const *const User = U.getUser();
+      if (auto const *const CI = dyn_cast<CallInst>(User)) {
+        return !CI->isLifetimeStartOrEnd();
+      }
+      return true;
+    });
+
+    AllocVec[StructIdx]->replaceAllUsesWith(Vb);
+    StructIdx = StructIdx + 1;
   }
 
   return SlotMap;
