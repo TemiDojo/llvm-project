@@ -44,7 +44,7 @@ STATISTIC(NumAddrTaken,
 
 using VarGuardSlotMap = DenseMap<Value *, Value *>;
 
-static VarGuardSlotMap insertVarGuards(const TargetLowering &TLI,
+void insertVarGuards(const TargetLowering &TLI,
                                        const LibcallLoweringInfo &Libcalls,
                                        Function *F, DomTreeUpdater *DTU,
                                        bool &HasPrologue, bool &HasIRCheck);
@@ -131,8 +131,7 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
   ++NumFunProtected;
 
   errs() << "calling insert varguards\n";
-  VarGuardSlotMap SlotMap =
-      insertVarGuards(*TLI, Libcalls, &F, DT ? &DTU : nullptr, Info.HasPrologue,
+  insertVarGuards(*TLI, Libcalls, &F, DT ? &DTU : nullptr, Info.HasPrologue,
                       Info.HasIRCheck);
 
   errs() << "calling insert checks\n";
@@ -483,52 +482,73 @@ static bool wrapAllocaWithVarGuardStruct(const TargetLowering &TLI,
   return true;
 }
 
-static VarGuardSlotMap insertVarGuards(const TargetLowering &TLI,
+void insertVarGuards(const TargetLowering &TLI,
                                        const LibcallLoweringInfo &Libcalls,
                                        Function *F, DomTreeUpdater *DTU,
                                        bool &HasPrologue, bool &HasIRCheck) {
-  VarGuardSlotMap SlotMap;
-
   LLVMContext &Ctx = F->getContext();
   SmallVector<Type *> StructVec{};
   SmallVector<AllocaInst *> AllocVec{};
 
   IRBuilder<> B(&F->getEntryBlock().front());
 
+  // Collect all the allocas and make slots in the struct
   for (BasicBlock &BB : llvm::make_early_inc_range(*F)) {
     for (auto &Inst : BB) {
       if (auto *AllocaI = dyn_cast<AllocaInst>(&Inst)) {
-        Type *AllocaType = AllocaI->getAllocatedType();
-        StructVec.push_back(AllocaType);
-        AllocVec.push_back(AllocaI);
+        if(!AllocaI->getMetadata("varguard.protect")) {
+	  Type *AllocaType = AllocaI->getAllocatedType();
+	  PointerType *CanaryType = PointerType::getUnqual(Ctx);
+	  StructVec.push_back(AllocaType);
+	  StructVec.push_back(CanaryType);
+	  AllocVec.push_back(AllocaI);
+	}
       }
     }
   }
 
-  ArrayRef<Type *> Test2(StructVec);
-  StructType *NewStructTy = StructType::create(Ctx, Test2, "varguardR-struct");
+  // Make the struct that holds the variables and canaries
+  ArrayRef<Type *> ElemTys(StructVec);
+  StructType *NewStructTy = StructType::create(Ctx, ElemTys, "varguardR-struct");
   AllocaInst *NewStructAI =
       B.CreateAlloca(NewStructTy, nullptr, "varguardR.obj");
+
+  // Get the canary
+  Value *GuardPtr = TLI.getIRStackGuard(B, Libcalls);
+  A
+  if (!GuardPtr) {
+    return;
+  }
 
   unsigned StructIdx = 0;
   SmallVector<Type *>::iterator It;
 
+  // Go through each slot in the StructVec and fill it
   for (It = StructVec.begin(); It != StructVec.end(); ++It) {
-    Value *Vb = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
+    
+    if (StructIdx % 2 == 0) {
+      Value *Va = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
                                   "vg.unsafe.alloca.ptr");
-    AllocVec[StructIdx]->replaceUsesWithIf(Vb, [](Use &U) -> bool {
-      auto const *const User = U.getUser();
-      if (auto const *const CI = dyn_cast<CallInst>(User)) {
-        return !CI->isLifetimeStartOrEnd();
-      }
-      return true;
-    });
+      AllocVec[StructIdx/2]->replaceUsesWithIf(Va, [](Use &U) -> bool {
+        auto const *const User = U.getUser();
+        if (auto const *const CI = dyn_cast<CallInst>(User)) {
+          return !CI->isLifetimeStartOrEnd();
+        }
+        return true;
+      });
 
-    AllocVec[StructIdx]->replaceAllUsesWith(Vb);
+    } else {
+   
+      Value *Vc = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
+		   "vg.canary.ptr");
+      Value *Guardslot = B.CreateLoad(B.getPtrTy(), GuardPtr, true, "VarGuard");
+      B.CreateStore(Guardslot, Vc, true);
+    }
+
     StructIdx = StructIdx + 1;
   }
 
-  return SlotMap;
+  return;
 }
 
 static bool visitUsesAndInsertChecks(const TargetLowering &TLI,
