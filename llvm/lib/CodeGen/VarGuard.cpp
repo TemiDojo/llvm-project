@@ -45,9 +45,8 @@ STATISTIC(NumAddrTaken,
 using VarGuardSlotMap = DenseMap<Value *, Value *>;
 
 void insertVarGuards(const TargetLowering &TLI,
-                                       const LibcallLoweringInfo &Libcalls,
-                                       Function *F, DomTreeUpdater *DTU,
-                                       bool &HasPrologue, bool &HasIRCheck);
+                     const LibcallLoweringInfo &Libcalls, Function *F,
+                     DomTreeUpdater *DTU, bool &HasPrologue, bool &HasIRCheck);
 static BasicBlock *createVarGuardFailBb(Function *F,
                                         const LibcallLoweringInfo &Libcalls);
 static bool insertChecks(const TargetLowering &TLI,
@@ -132,7 +131,7 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
 
   errs() << "calling insert varguards\n";
   insertVarGuards(*TLI, Libcalls, &F, DT ? &DTU : nullptr, Info.HasPrologue,
-                      Info.HasIRCheck);
+                  Info.HasIRCheck);
 
   errs() << "calling insert checks\n";
   // insertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, SlotMap);
@@ -483,9 +482,8 @@ static bool wrapAllocaWithVarGuardStruct(const TargetLowering &TLI,
 }
 
 void insertVarGuards(const TargetLowering &TLI,
-                                       const LibcallLoweringInfo &Libcalls,
-                                       Function *F, DomTreeUpdater *DTU,
-                                       bool &HasPrologue, bool &HasIRCheck) {
+                     const LibcallLoweringInfo &Libcalls, Function *F,
+                     DomTreeUpdater *DTU, bool &HasPrologue, bool &HasIRCheck) {
   LLVMContext &Ctx = F->getContext();
   SmallVector<Type *> StructVec{};
   SmallVector<AllocaInst *> AllocVec{};
@@ -496,26 +494,26 @@ void insertVarGuards(const TargetLowering &TLI,
   for (BasicBlock &BB : llvm::make_early_inc_range(*F)) {
     for (auto &Inst : BB) {
       if (auto *AllocaI = dyn_cast<AllocaInst>(&Inst)) {
-        if(!AllocaI->getMetadata("varguard.protect")) {
-	  Type *AllocaType = AllocaI->getAllocatedType();
-	  PointerType *CanaryType = PointerType::getUnqual(Ctx);
-	  StructVec.push_back(AllocaType);
-	  StructVec.push_back(CanaryType);
-	  AllocVec.push_back(AllocaI);
-	}
+        if (AllocaI->getMetadata("varguard.protect")) {
+          Type *AllocaType = AllocaI->getAllocatedType();
+          PointerType *CanaryType = PointerType::getUnqual(Ctx);
+          StructVec.push_back(AllocaType);
+          StructVec.push_back(CanaryType);
+          AllocVec.push_back(AllocaI);
+        }
       }
     }
   }
 
   // Make the struct that holds the variables and canaries
   ArrayRef<Type *> ElemTys(StructVec);
-  StructType *NewStructTy = StructType::create(Ctx, ElemTys, "varguardR-struct");
+  StructType *NewStructTy =
+      StructType::create(Ctx, ElemTys, "varguardR-struct");
   AllocaInst *NewStructAI =
       B.CreateAlloca(NewStructTy, nullptr, "varguardR.obj");
 
   // Get the canary
   Value *GuardPtr = TLI.getIRStackGuard(B, Libcalls);
-  A
   if (!GuardPtr) {
     return;
   }
@@ -525,11 +523,11 @@ void insertVarGuards(const TargetLowering &TLI,
 
   // Go through each slot in the StructVec and fill it
   for (It = StructVec.begin(); It != StructVec.end(); ++It) {
-    
+
     if (StructIdx % 2 == 0) {
       Value *Va = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
-                                  "vg.unsafe.alloca.ptr");
-      AllocVec[StructIdx/2]->replaceUsesWithIf(Va, [](Use &U) -> bool {
+                                    "vg.unsafe.alloca.ptr");
+      AllocVec[StructIdx / 2]->replaceUsesWithIf(Va, [](Use &U) -> bool {
         auto const *const User = U.getUser();
         if (auto const *const CI = dyn_cast<CallInst>(User)) {
           return !CI->isLifetimeStartOrEnd();
@@ -538,9 +536,9 @@ void insertVarGuards(const TargetLowering &TLI,
       });
 
     } else {
-   
+
       Value *Vc = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
-		   "vg.canary.ptr");
+                                    "vg.canary.ptr");
       Value *Guardslot = B.CreateLoad(B.getPtrTy(), GuardPtr, true, "VarGuard");
       B.CreateStore(Guardslot, Vc, true);
     }
