@@ -1,12 +1,26 @@
-#include <string.h>
+// RUN: %vgcc -DTEST=1 %s -o %t.ll && %vgopt %t.ll -o %t.vg.ll && %vglink
+// %t.vg.ll -o %t && not --crash %t RUN: %vgcc -DTEST=2 %s -o %t.ll && %vgopt
+// %t.ll -o %t.vg.ll && %vglink %t.vg.ll -o %t && %t RUN: %vgcc -DTEST=3 %s -o
+// %t.ll && %vgopt %t.ll -o %t.vg.ll && %vglink %t.vg.ll -o %t && %t RUN: %vgcc
+// -DTEST=4 %s -o %t.ll && %vgopt %t.ll -o %t.vg.ll && %vglink %t.vg.ll -o %t &&
+// %t RUN: %vgcc -DTEST=5 %s -o %t.ll && %vgopt %t.ll -o %t.vg.ll && %vglink
+// %t.vg.ll -o %t && %t RUN: %vgcc -DTEST=6 %s -o %t.ll && %vgopt %t.ll -o
+// %t.vg.ll && %vglink %t.vg.ll -o %t && %t RUN: %vgcc -DTEST=7 %s -o %t.ll &&
+// %vgopt %t.ll -o %t.vg.ll && %vglink %t.vg.ll -o %t && not --crash %t RUN:
+// %vgcc -DTEST=8 %s -o %t.ll && %vgopt %t.ll -o %t.vg.ll && %vglink %t.vg.ll -o
+// %t && %t RUN: %vgcc -DTEST=9 %s -o %t.ll && %vgopt %t.ll -o %t.vg.ll &&
+// %vglink %t.vg.ll -o %t && %t
 
-/* 
+/*
  * Usage
- * Select one test at compile time; only that test is compiled.
- *  Recommended: ./scripts/vg_runner2.sh -o0 -t1
+ *  Run and verify all tests:
+ *  	build/bin/llvm-lit -a tests/t2.c
+ *  Run a single test:
+ *  	scripts/vg.sh -o0 -t1
  *  Other options:
- *    clang -std=c2y -O0 -Xclang -disable-O0-optnone -DTEST=1 -fno-stack-protector -S -emit-llvm tests/t2.c -o t2.ll
- *    clang -std=c2y -O1 -DTEST=1 -fno-stack-protector -S -emit-llvm tests/t2.c -o t2.ll
+ *    clang -std=c2y -O0 -Xclang -disable-O0-optnone -DTEST=1
+ * -fno-stack-protector -S -emit-llvm tests/t2.c -o t2.ll clang -std=c2y -O1
+ * -DTEST=1 -fno-stack-protector -S -emit-llvm tests/t2.c -o t2.ll
  *
  *
  * Known Limitations
@@ -18,18 +32,26 @@
  *
  */
 
+#include <stdio.h>
+#include <time.h>
+
+// Keeps each test in its own stack frame at -O1 and above.
+// Build with -DNOINLINE= to turn this off.
+#ifndef NOINLINE
+#define NOINLINE __attribute__((noinline))
+#endif
+
+// For performance measurements
+#ifndef ITERS
+#define ITERS 1000000
+#endif
+
 #ifndef TEST
-#error "Select a test with -DTEST=<n>, e.g. clang -DTEST=3 t2.c"
+#error "Select a test with -DTEST=<n>, e.g. clang -DTEST=1 t2.c"
 #endif
 
 #if TEST < 1 || TEST > 9
 #error "TEST must be between 1 and 9"
-#endif
-
-// Keeps each test in its own stack frame at -O1 and above.
-// Build with -DNOINLINE=to turn this off.
-#ifndef NOINLINE
-#define NOINLINE __attribute__((noinline))
 #endif
 
 #if TEST == 1
@@ -37,11 +59,12 @@
 // - Last byte of buf2 overflows to buf1
 // - Expected output: exit 134 (VarGuard catches it)
 NOINLINE void test1(void) {
-        char buf1[8];
-        char buf2[8];
-        for (int i = 0; i <= sizeof(buf2); i++) {
-                buf2[i] = 'A';
-        }
+  char buf1[8];
+  char buf2[8];
+  for (int i = 0; i <= sizeof(buf2); i++) {
+    buf2[i] = 'A';
+  }
+  char c = buf2[0];
 }
 #endif
 
@@ -49,11 +72,11 @@ NOINLINE void test1(void) {
 // No overflow
 // - Expected output: exit 0
 NOINLINE void test2(void) {
-        char buf1[8];
-        char buf2[8];
-        for (int i = 0; i < sizeof(buf2); i++) {
-                buf2[i] = 'A';
-        }
+  char buf1[8];
+  char buf2[8];
+  for (int i = 0; i < sizeof(buf2); i++) {
+    buf2[i] = 'A';
+  }
 }
 #endif
 
@@ -65,9 +88,9 @@ NOINLINE void test2(void) {
 // - Direct out-of-bounds write (the compiler sees the bug)
 // - Expected output: exit 0
 NOINLINE void test3(void) {
-        char buf1[8];
-        char buf2[5];
-        buf2[5] = 'A';
+  char buf1[8];
+  char buf2[5];
+  buf2[5] = 'A';
 }
 #endif
 
@@ -78,9 +101,9 @@ NOINLINE void test3(void) {
 // - Direct out-of-bounds write (the compiler sees the bug)
 // - Expected output: exit 0
 NOINLINE void test4(void) {
-        char buf1[8];
-        char buf2[8];
-        buf2[-1] = 'A';
+  char buf1[8];
+  char buf2[8];
+  buf2[-1] = 'A';
 }
 #endif
 
@@ -92,9 +115,9 @@ NOINLINE void test4(void) {
 //   store in this function
 // - Expected output: exit 0 (known limitation)
 NOINLINE void test5(void) {
-        char buf1[8];
-        char buf2[8];
-        memset(buf2, 'A', sizeof(buf2) + 1);
+  char buf1[8];
+  char buf2[8];
+  memset(buf2, 'A', sizeof(buf2) + 1);
 }
 #endif
 
@@ -104,12 +127,12 @@ NOINLINE void test5(void) {
 //   buf2 instead of indexing buf2 directly
 // - Expected output: exit 0 (known limitation)
 NOINLINE void test6(void) {
-        char buf1[8];
-        char buf2[8];
-        char *p = buf2;
-        for (int i = 0; i <= sizeof(buf2); i++) {
-                p[i] = 'A';
-        }
+  char buf1[8];
+  char buf2[8];
+  char *p = buf2;
+  for (int i = 0; i <= sizeof(buf2); i++) {
+    p[i] = 'A';
+  }
 }
 #endif
 
@@ -118,11 +141,11 @@ NOINLINE void test6(void) {
 // - Same as test1, but with an int array
 // - Expected output: exit 134
 NOINLINE void test7(void) {
-        int buf1[4];
-        int buf2[4];
-        for (int i = 0; i <= 4; i++) {
-                buf2[i] = 'A';
-        }
+  int buf1[4];
+  int buf2[4];
+  for (int i = 0; i <= 4; i++) {
+    buf2[i] = 'A';
+  }
 }
 #endif
 
@@ -132,8 +155,11 @@ NOINLINE void test7(void) {
 //   inside the same struct (the compiler sees the bug)
 // - Expected output: exit 0 (known limitation)
 NOINLINE void test8(void) {
-        struct { char coursename[8]; int id; } s;
-        s.coursename[8] = 'A';
+  struct {
+    char coursename[8];
+    int id;
+  } s;
+  s.coursename[8] = 'A';
 }
 #endif
 
@@ -144,9 +170,9 @@ NOINLINE void test8(void) {
 // - Direct write (the compiler sees the bug)
 // - Expected output: exit 0 (known limitation)
 NOINLINE void test9(void) {
-        char buf1[8];
-        char buf2[8];
-        buf2[16] = 'A';
+  char buf1[8];
+  char buf2[8];
+  buf2[16] = 'A';
 }
 #endif
 
@@ -154,6 +180,16 @@ NOINLINE void test9(void) {
 #define XCAT(a, b) CAT(a, b)
 
 int main(void) {
-        XCAT(test, TEST)();  // expands to testN() when built with -DTEST=N
-}
+  test1();
+  /*
+  clock_t start = clock();
 
+  for (int i = 0; i < ITERS; i++) {
+    XCAT(test, TEST)(); // expands to testN() when built with -DTEST=N
+  }
+
+  clock_t end = clock();
+  double ms = (end - start) * 1000.0 / CLOCKS_PER_SEC;
+  printf("test%d: %d calls, %.3f ms\n", TEST, ITERS, ms);
+  */
+}

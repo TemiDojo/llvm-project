@@ -44,14 +44,15 @@ STATISTIC(NumAddrTaken,
 
 using VarGuardSlotMap = DenseMap<Value *, Value *>;
 
-void insertVarGuards(const TargetLowering &TLI,
-                     const LibcallLoweringInfo &Libcalls, Function *F,
-                     DomTreeUpdater *DTU, bool &HasPrologue, bool &HasIRCheck);
+VarGuardSlotMap insertVarGuards(const TargetLowering &TLI,
+                                const LibcallLoweringInfo &Libcalls,
+                                Function *F, DomTreeUpdater *DTU,
+                                bool &HasPrologue, bool &HasIRCheck);
 static BasicBlock *createVarGuardFailBb(Function *F,
                                         const LibcallLoweringInfo &Libcalls);
 static bool insertChecks(const TargetLowering &TLI,
                          const LibcallLoweringInfo &Libcalls, Function *F,
-                         DomTreeUpdater *DTU, VarGuardSlotMap SlotMap);
+                         DomTreeUpdater *DTU, const VarGuardSlotMap &SlotMap);
 static bool visitUsesAndInsertChecks(const TargetLowering &TLI,
                                      const LibcallLoweringInfo &Libcalls,
                                      Function *F, DomTreeUpdater *DTU,
@@ -130,11 +131,12 @@ PreservedAnalyses VarGuardPass::run(Function &F, FunctionAnalysisManager &FAM) {
   ++NumFunProtected;
 
   errs() << "calling insert varguards\n";
-  insertVarGuards(*TLI, Libcalls, &F, DT ? &DTU : nullptr, Info.HasPrologue,
-                  Info.HasIRCheck);
+  VarGuardSlotMap SlotMap =
+      insertVarGuards(*TLI, Libcalls, &F, DT ? &DTU : nullptr, Info.HasPrologue,
+                      Info.HasIRCheck);
 
   errs() << "calling insert checks\n";
-  // insertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, SlotMap);
+  insertChecks(*TLI, Libcalls, &F, DT ? &DTU : nullptr, SlotMap);
 
   PreservedAnalyses PA;
   PA.preserve<VarGuardLayoutAnalysis>();
@@ -481,14 +483,15 @@ static bool wrapAllocaWithVarGuardStruct(const TargetLowering &TLI,
   return true;
 }
 
-void insertVarGuards(const TargetLowering &TLI,
-                     const LibcallLoweringInfo &Libcalls, Function *F,
-                     DomTreeUpdater *DTU, bool &HasPrologue, bool &HasIRCheck) {
+VarGuardSlotMap insertVarGuards(const TargetLowering &TLI,
+                                const LibcallLoweringInfo &Libcalls,
+                                Function *F, DomTreeUpdater *DTU,
+                                bool &HasPrologue, bool &HasIRCheck) {
   LLVMContext &Ctx = F->getContext();
   SmallVector<Type *> StructVec{};
   SmallVector<AllocaInst *> AllocVec{};
-
   IRBuilder<> B(&F->getEntryBlock().front());
+  VarGuardSlotMap SlotMap;
 
   // Collect all the allocas and make slots in the struct
   for (BasicBlock &BB : llvm::make_early_inc_range(*F)) {
@@ -505,6 +508,9 @@ void insertVarGuards(const TargetLowering &TLI,
     }
   }
 
+  if (AllocVec.empty())
+    return SlotMap;
+
   // Make the struct that holds the variables and canaries
   ArrayRef<Type *> ElemTys(StructVec);
   StructType *NewStructTy =
@@ -515,38 +521,30 @@ void insertVarGuards(const TargetLowering &TLI,
   // Get the canary
   Value *GuardPtr = TLI.getIRStackGuard(B, Libcalls);
   if (!GuardPtr) {
-    return;
+    return SlotMap;
   }
 
-  unsigned StructIdx = 0;
-  SmallVector<Type *>::iterator It;
+  // For every alloca, place its pointer and canary into slots in the struct
+  for (unsigned AllocIdx = 0; AllocIdx < AllocVec.size(); ++AllocIdx) {
+    Value *Va = B.CreateStructGEP(NewStructTy, NewStructAI, 2 * AllocIdx,
+                                  "vg.unsafe.alloca.ptr");
+    Value *Vc = B.CreateStructGEP(NewStructTy, NewStructAI, 2 * AllocIdx + 1,
+                                  "vg.canary.ptr");
+    AllocVec[AllocIdx]->replaceUsesWithIf(Va, [](Use &U) -> bool {
+      auto const *const User = U.getUser();
+      if (auto const *const CI = dyn_cast<CallInst>(User)) {
+        return !CI->isLifetimeStartOrEnd();
+      }
+      return true;
+    });
 
-  // Go through each slot in the StructVec and fill it
-  for (It = StructVec.begin(); It != StructVec.end(); ++It) {
+    Value *Guardslot = B.CreateLoad(B.getPtrTy(), GuardPtr, true, "VarGuard");
+    B.CreateStore(Guardslot, Vc, true);
 
-    if (StructIdx % 2 == 0) {
-      Value *Va = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
-                                    "vg.unsafe.alloca.ptr");
-      AllocVec[StructIdx / 2]->replaceUsesWithIf(Va, [](Use &U) -> bool {
-        auto const *const User = U.getUser();
-        if (auto const *const CI = dyn_cast<CallInst>(User)) {
-          return !CI->isLifetimeStartOrEnd();
-        }
-        return true;
-      });
-
-    } else {
-
-      Value *Vc = B.CreateStructGEP(NewStructTy, NewStructAI, StructIdx,
-                                    "vg.canary.ptr");
-      Value *Guardslot = B.CreateLoad(B.getPtrTy(), GuardPtr, true, "VarGuard");
-      B.CreateStore(Guardslot, Vc, true);
-    }
-
-    StructIdx = StructIdx + 1;
+    SlotMap[Va] = Vc;
   }
 
-  return;
+  return SlotMap;
 }
 
 static bool visitUsesAndInsertChecks(const TargetLowering &TLI,
@@ -558,6 +556,8 @@ static bool visitUsesAndInsertChecks(const TargetLowering &TLI,
   auto *M = F->getParent();
 
   bool Changed = false;
+
+  // Loop over every instruction that "uses" the alloca
   for (User *U : llvm::make_early_inc_range(Ins->users())) {
 
     auto *I = dyn_cast<Instruction>(U);
@@ -569,6 +569,7 @@ static bool visitUsesAndInsertChecks(const TargetLowering &TLI,
 
     errs() << "done creating FailBB\n";
     switch (I->getOpcode()) {
+    /*
     case Instruction::Store: {
       auto *SI = cast<StoreInst>(I);
 
@@ -579,35 +580,66 @@ static bool visitUsesAndInsertChecks(const TargetLowering &TLI,
 
       Value *Guard = getVarGuardValue(TLI, Libcalls, M, B);
       errs() << "return from getVG check\n";
-      if (Guard) {
-        errs() << "adding check\n";
-        LoadInst *L12 = B.CreateLoad(B.getPtrTy(), VGslot, true);
-        auto *Cmp = cast<ICmpInst>(B.CreateICmpNE(Guard, L12));
-        auto SuccessProb =
-            BranchProbabilityInfo::getBranchProbStackProtector(true);
-        auto FailureProb =
-            BranchProbabilityInfo::getBranchProbStackProtector(false);
-        MDNode *Weights = MDBuilder(F->getContext())
-                              .createBranchWeights(FailureProb.getNumerator(),
-                                                   SuccessProb.getNumerator());
-        SplitBlockAndInsertIfThen(Cmp, CheckLoc, false, Weights, DTU, nullptr,
-                                  Fb);
-        auto *BI = cast<CondBrInst>(Cmp->getParent()->getTerminator());
-        BasicBlock *NewBB = BI->getSuccessor(1);
-        NewBB->setName("VG_return");
-        auto *BB = I->getParent();
-        NewBB->moveAfter(BB);
+      if (!Guard)
+        break;
 
-        Cmp->setPredicate(Cmp->getInversePredicate());
-        BI->swapSuccessors();
-        Changed |= true;
-      } else {
-        Changed |= false;
-      }
+      errs() << "adding check\n";
+      LoadInst *L12 = B.CreateLoad(B.getPtrTy(), VGslot, true);
+      auto *Cmp = cast<ICmpInst>(B.CreateICmpNE(Guard, L12));
+      auto SuccessProb =
+          BranchProbabilityInfo::getBranchProbStackProtector(true);
+      auto FailureProb =
+          BranchProbabilityInfo::getBranchProbStackProtector(false);
+      MDNode *Weights = MDBuilder(F->getContext())
+                            .createBranchWeights(FailureProb.getNumerator(),
+                                                 SuccessProb.getNumerator());
+      // Split after the store
+      SplitBlockAndInsertIfThen(Cmp, CheckLoc, false, Weights, DTU, nullptr,
+                                Fb);
+      auto *BI = cast<CondBrInst>(Cmp->getParent()->getTerminator());
+      BasicBlock *NewBB = BI->getSuccessor(1);
+      NewBB->setName("VG_return");
+      auto *BB = I->getParent();
+      NewBB->moveAfter(BB);
+
+      Cmp->setPredicate(Cmp->getInversePredicate());
+      BI->swapSuccessors();
+      Changed |= true;
+      break;
+    }
+    */
+    case Instruction::Load: {
+      auto *LI = cast<LoadInst>(I);
+      IRBuilder<> B(LI);
+
+      Value *Guard = getVarGuardValue(TLI, Libcalls, M, B);
+      errs() << "return from getVG check\n";
+      if (!Guard)
+        break;
+
+      errs() << "adding check\n";
+      LoadInst *L12 = B.CreateLoad(B.getPtrTy(), VGslot, true);
+      auto *Cmp = cast<ICmpInst>(B.CreateICmpNE(Guard, L12));
+      auto SuccessProb =
+          BranchProbabilityInfo::getBranchProbStackProtector(true);
+      auto FailureProb =
+          BranchProbabilityInfo::getBranchProbStackProtector(false);
+      MDNode *Weights = MDBuilder(F->getContext())
+                            .createBranchWeights(FailureProb.getNumerator(),
+                                                 SuccessProb.getNumerator());
+      // Split before the load
+      SplitBlockAndInsertIfThen(Cmp, LI, false, Weights, DTU, nullptr, Fb);
+      auto *BB = Cmp->getParent();
+      auto *BI = cast<CondBrInst>(BB->getTerminator());
+      BasicBlock *NewBB = BI->getSuccessor(1);
+      NewBB->setName("VG_return");
+      NewBB->moveAfter(BB);
+      Cmp->setPredicate(Cmp->getInversePredicate());
+      BI->swapSuccessors();
+      Changed = true;
       break;
     }
     case Instruction::GetElementPtr:
-
       Changed |= visitUsesAndInsertChecks(TLI, Libcalls, F, DTU, I, VGslot, Fb);
       break;
     default:
@@ -615,13 +647,12 @@ static bool visitUsesAndInsertChecks(const TargetLowering &TLI,
       break;
     }
   }
-
   return Changed;
 }
 
 static bool insertChecks(const TargetLowering &TLI,
                          const LibcallLoweringInfo &Libcalls, Function *F,
-                         DomTreeUpdater *DTU, VarGuardSlotMap SlotMap) {
+                         DomTreeUpdater *DTU, const VarGuardSlotMap &SlotMap) {
 
   bool Changed = false;
   BasicBlock *FailBB = nullptr;
@@ -632,7 +663,7 @@ static bool insertChecks(const TargetLowering &TLI,
     if (!I)
       continue;
     Value *GuardStore = Entry.second;
-    Changed =
+    Changed |=
         visitUsesAndInsertChecks(TLI, Libcalls, F, DTU, I, GuardStore, FailBB);
   }
 
